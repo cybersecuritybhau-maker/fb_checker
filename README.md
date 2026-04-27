@@ -1,24 +1,21 @@
-# 🔥 FB Phone Checker v2.0
+# 🔥 FB OTP Trigger Tool v3.0
 
-Facebook phone number checker with multi-threading, proxy rotation, and OTP trigger. Works worldwide.
+Facebook forgot password OTP trigger tool.
+যে কোন ফরম্যাটে ফোন নাম্বার দিয়ে Facebook OTP ট্রিগার করুন।
 
 ## Features
-
-- ✅ Worldwide phone number support (BD, US, UK, India, etc.)
-- ✅ Multi-threading (up to 20 threads)
-- ✅ Proxy rotation (HTTP/HTTPS/SOCKS5)
-- ✅ Automatic OTP trigger on valid accounts
-- ✅ Auto-save valid accounts in real-time
-- ✅ JSON + TXT export
+- ✅ যেকোনো ফরম্যাটে নাম্বার নিবে (+ ছাড়া, কমা ছাড়া, স্পেস দিয়েও)
+- ✅ Multi-threading (3-5 threads)
+- ✅ Proxy support (HTTP/HTTPS)
+- ✅ Real-time OTP trigger on Facebook forgot password
+- ✅ Auto-save results
 - ✅ Termux optimized
-- ✅ No Telegram dependency
 
-## Installation
-
+## Installation (Termux)
 ```bash
 pkg update -y && pkg upgrade -y
 pkg install python chromium -y
-pip install selenium webdriver-manager phonenumbers
+pip install selenium webdriver-manager phonenumbers requests beautifulsoup4
 git clone https://github.com/cybersecuritybhau-maker/fb_checker.git
 cd fb_checker
 python fb_checker.py
